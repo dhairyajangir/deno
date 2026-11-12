@@ -1,0 +1,187 @@
+diff --git a/ext/fetch/23_response.js b/ext/fetch/23_response.js
+index f598506..c004412 100644
+--- a/ext/fetch/23_response.js
++++ b/ext/fetch/23_response.js
+@@ -697,8 +697,8 @@ class Response {
+     const prefix = "Failed to execute 'Response.json'";
+     data = webidlConvertersAny(data);
+     const defaultInit = init === undefined || init === null;
+-    const str = serializeJSValueToJSONString(data);
+     if (defaultInit) {
++      const str = serializeJSValueToJSONString(data);
+       const response = webidl.createBranded(Response);
+       initializeResponseBase(response, newInnerResponse(), "response");
+       response[_lazyStaticBody] = str;
+@@ -714,6 +714,7 @@ class Response {
+     }
+     init = webidlConvertersResponseInitFast(init, prefix, "Argument 2");
+ 
++    const str = serializeJSValueToJSONString(data);
+     const res = extractBody(str);
+     res.contentType = "application/json";
+     const response = webidl.createBranded(Response);
+@@ -910,13 +911,42 @@ const webidlConvertersResponseInitFast = webidl
+     // Fast path, if not a proxy
+     if (typeof init === "object" && !core.isProxy(init)) {
+       // Not a proxy fast path
+-      const status = init.status !== undefined
+-        ? webidlConvertersUnsignedShort(init.status)
++      // Dictionary members are converted in lexicographical order. Convert
++      // headers before reading status because header conversion may run user code.
++      const headersValue = init.headers;
++      const headers = headersValue === undefined
++        ? undefined
++        : webidlConvertersHeadersInit(
++          headersValue,
++          prefix,
++          context
++            ? `'headers' of 'ResponseInit' (${context})`
++            : "'headers' of 'ResponseInit'",
++          opts,
++        );
++      const statusValue = init.status;
++      const status = statusValue !== undefined
++        ? webidlConvertersUnsignedShort(
++          statusValue,
++          prefix,
++          context
++            ? `'status' of 'ResponseInit' (${context})`
++            : "'status' of 'ResponseInit'",
++          opts,
++        )
+         : 200;
+-      const statusText = init.statusText !== undefined
+-        ? webidlConvertersByteString(init.statusText)
++      const statusTextValue = init.statusText;
++      const statusText = statusTextValue !== undefined
++        ? webidlConvertersByteString(
++          statusTextValue,
++          prefix,
++          context
++            ? `'statusText' of 'ResponseInit' (${context})`
++            : "'statusText' of 'ResponseInit'",
++          opts,
++        )
+         : "";
+-      return { status, statusText, headers: init.headers };
++      return { status, statusText, headers };
+     }
+     // Slow default path
+     return webidlConvertersResponseInit(init, prefix, context, opts);
+diff --git a/tests/unit/response_test.ts b/tests/unit/response_test.ts
+index 4e5261a..4a2337c 100644
+--- a/tests/unit/response_test.ts
++++ b/tests/unit/response_test.ts
+@@ -2,6 +2,7 @@
+ import {
+   assert,
+   assertEquals,
++  assertStrictEquals,
+   assertStringIncludes,
+   assertThrows,
+ } from "./test_util.ts";
+@@ -73,6 +74,104 @@ Deno.test(function responseNullInit() {
+   assertEquals(response.status, 200);
+ });
+ 
++for (
++  const [name, create] of [
++    ["Response", (init: ResponseInit) => new Response(null, init)],
++    ["Response.json", (init: ResponseInit) => Response.json(null, init)],
++  ] as const
++) {
++  for (const proxy of [false, true]) {
++    Deno.test(`${name} converts ResponseInit members in order (proxy: ${proxy})`, () => {
++      const calls: string[] = [];
++      const init = {
++        get headers() {
++          calls.push("headers");
++          return {
++            get "X-Test"() {
++              calls.push("header value");
++              return "value";
++            },
++          };
++        },
++        get status() {
++          calls.push("status");
++          return 200;
++        },
++        get statusText() {
++          calls.push("statusText");
++          return "OK";
++        },
++      };
++      const response = create(proxy ? new Proxy(init, {}) : init);
++      assertEquals(calls, ["headers", "header value", "status", "statusText"]);
++      assertEquals(response.headers.get("x-test"), "value");
++    });
++  }
++
++  Deno.test(`${name} converts headers before reading status`, () => {
++    const calls: string[] = [];
++    const headerError = new Error("header conversion");
++    const init = {
++      get headers() {
++        calls.push("headers");
++        return {
++          get "X-Test"(): string {
++            calls.push("header value");
++            throw headerError;
++          },
++        };
++      },
++      get status(): number {
++        calls.push("status");
++        throw new Error("status getter");
++      },
++    };
++    assertStrictEquals(assertThrows(() => create(init)), headerError);
++    assertEquals(calls, ["headers", "header value"]);
++  });
++}
++
++Deno.test(function responseJsonConvertsInitBeforeSerializingData() {
++  const calls: string[] = [];
++  const data = {
++    toJSON() {
++      calls.push("toJSON");
++      return { ok: true };
++    },
++  };
++  const init = {
++    get headers() {
++      calls.push("headers");
++      return {};
++    },
++    get status() {
++      calls.push("status");
++      return 200;
++    },
++    get statusText() {
++      calls.push("statusText");
++      return "OK";
++    },
++  };
++  Response.json(data, init);
++  assertEquals(calls, ["headers", "status", "statusText", "toJSON"]);
++});
++
++Deno.test(function responseJsonInitErrorPrecedesSerialization() {
++  const initError = new Error("init getter");
++  const data = {
++    toJSON() {
++      throw new Error("toJSON");
++    },
++  };
++  const init = {
++    get headers(): HeadersInit {
++      throw initError;
++    },
++  };
++  assertStrictEquals(assertThrows(() => Response.json(data, init)), initError);
++});
++
+ Deno.test(function customInspectFunction() {
+   const response = new Response();
+   assertEquals(
