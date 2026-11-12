@@ -1,0 +1,512 @@
+# Proposed fork-only runtime validation; this workflow can run on its guarded branch push.
+# Hosted local-mode validation is not upstream CI or a merge.
+name: Deno 37157 fork cargo runtime validation
+on:
+  push:
+    branches:
+      - validation/deno37157-cargo-runtime-20261112-v2
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: >-
+      ${{ github.event_name == 'push' && github.event.created &&
+          github.repository == 'dhairyajangir/deno' &&
+          github.event.repository.fork && !github.event.repository.private &&
+          github.ref == 'refs/heads/validation/deno37157-cargo-runtime-20261112-v2' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [runtime]
+    env:
+      EXPECTED_BASE: e7b39ebd55c85aaf6a29290c1f5a99e2e21e09dd
+      EXPECTED_RED_TREE: a1ea12eb93281757374a95602047afff1a01bd9f
+      EXPECTED_CANDIDATE_TREE: b60ba5c489a1cbe217e8e496badfca892e8e98c0
+      PATCH_SHA256: 16820a37291944e683322d1377ed3e873405fadf36e4d755193c737f0ed06d40
+      PATHS_SHA256: 313d64d8d86db79b3d6bbb75dbacab7fd3bfea296774412ecc85f1f426e0be63
+      EXPECTED_STD_SHA: 9c5b7101545e53f031b6e7757da655d5d8ee3fc2
+      EXPECTED_BODY_LIST_MARKER: "unit::body_test: test"
+      EXPECTED_RESPONSE_LIST_MARKER: "unit::response_test: test"
+      EXPECTED_BODY_GREEN_COUNT: "33"
+      EXPECTED_RESPONSE_GREEN_COUNT: "9"
+      CARGO_PROFILE_DEV_DEBUG: 0
+      NO_COLOR: 1
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Checkout reviewed validation branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify validation payload and select frozen base
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_head="$(git rev-parse HEAD)"
+          parent_count="$(git rev-list --parents -n 1 HEAD | wc -w)"
+          actual_parent="$(git rev-parse HEAD^1)"
+          commit_identities="$(git show -s --format='%ae|%ce' HEAD)"
+          test "$actual_head" = "$GITHUB_SHA"
+          test "$parent_count" -eq 2
+          test "$actual_parent" = "$EXPECTED_BASE"
+          test "$commit_identities" = 'thinkelite@hotmail.com|thinkelite@hotmail.com'
+          printf 'A\t.github/codex-deno37157-paths.txt\nA\t.github/codex-deno37157.patch\nA\t.github/workflows/codex-deno37157.yml\n' > "$RUNNER_TEMP/expected-validation-paths.txt"
+          git diff-tree --no-commit-id --name-status -r HEAD^1 HEAD > "$RUNNER_TEMP/actual-validation-paths.txt"
+          cmp "$RUNNER_TEMP/expected-validation-paths.txt" "$RUNNER_TEMP/actual-validation-paths.txt"
+          for payload in .github/codex-deno37157-paths.txt .github/codex-deno37157.patch .github/workflows/codex-deno37157.yml; do
+            entry="$(git ls-tree HEAD -- "$payload")"
+            meta="${entry%%$'\t'*}"
+            listed_path="${entry#*$'\t'}"
+            read -r mode object_type object_id <<< "$meta"
+            test "$mode" = 100644
+            test "$object_type" = blob
+            test "$listed_path" = "$payload"
+            printf '%s\n' "$object_id" | grep -Ex '[0-9a-f]{40}'
+          done
+          cp .github/codex-deno37157.patch "$RUNNER_TEMP/candidate.patch"
+          cp .github/codex-deno37157-paths.txt "$RUNNER_TEMP/candidate-paths.txt"
+          printf '%s  %s\n' "$PATCH_SHA256" "$RUNNER_TEMP/candidate.patch" | sha256sum -c -
+          printf '%s  %s\n' "$PATHS_SHA256" "$RUNNER_TEMP/candidate-paths.txt" | sha256sum -c -
+          git -c advice.detachedHead=false checkout --detach "$EXPECTED_BASE"
+          git apply --check "$RUNNER_TEMP/candidate.patch"
+          checkout_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$checkout_status"
+      - name: Install Deno
+        uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282
+        with:
+          deno-version: v2.9.8
+      - name: Install repository Rust toolchain
+        uses: dsherret/rust-toolchain-file@3551321aa44dd44a0393eb3b6bdfbc5d25ecf621
+      - name: Initialize and verify pinned standard-library test submodule
+        shell: bash
+        run: |
+          set -euo pipefail
+          std_gitlink="$(git rev-parse "$EXPECTED_BASE:tests/util/std")"
+          test "$std_gitlink" = "$EXPECTED_STD_SHA"
+          git submodule update --init --recursive --depth=1 -- tests/util/std
+          git -C tests/util/std ls-tree -r -z --full-tree HEAD > "$RUNNER_TEMP/std-tree.bin"
+          python3 - "$RUNNER_TEMP/std-tree.bin" <<'PYCODE'
+          from pathlib import Path
+          import sys
+          raw = Path(sys.argv[1]).read_bytes()
+          if not raw or not raw.endswith(b'\0'):
+              raise SystemExit('std tree is empty, incomplete or malformed')
+          entries = raw[:-1].split(b'\0')
+          for entry in entries:
+              try:
+                  meta, path = entry.split(b'\t', 1)
+                  mode, kind, oid = meta.split(b' ')
+              except ValueError as exc:
+                  raise SystemExit('malformed std tree entry') from exc
+              if not path or len(oid) != 40 or any(c not in b'0123456789abcdef' for c in oid):
+                  raise SystemExit('invalid std tree path or object id')
+              if mode == b'160000':
+                  raise SystemExit(f'nested std gitlink is not yet supported: {path!r}')
+              if mode not in (b'100644', b'100755', b'120000') or kind != b'blob':
+                  raise SystemExit(f'unexpected std tree mode: {mode!r}')
+          print(f'Pinned std tree inspected: {len(entries)} entries; no nested gitlinks')
+          PYCODE
+          sha256sum "$RUNNER_TEMP/std-tree.bin"
+          std_head="$(git -C tests/util/std rev-parse HEAD)"
+          test "$std_head" = "$EXPECTED_STD_SHA"
+          std_status="$(git -C tests/util/std status --porcelain --untracked-files=all --ignored=matching)"
+          test -z "$std_status"
+          git -C tests/util/std submodule status --recursive > "$RUNNER_TEMP/std-submodules.txt"
+          test ! -s "$RUNNER_TEMP/std-submodules.txt"
+      - name: Apply only candidate regression tests to unchanged baseline
+        if: ${{ matrix.suite == 'runtime' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --include=tests/unit/body_test.ts "$RUNNER_TEMP/candidate.patch"
+          git add -- tests/unit/body_test.ts
+          actual_tree="$(git write-tree)"
+          test "$actual_tree" = "$EXPECTED_RED_TREE"
+          git diff --exit-code
+          checkout_untracked="$(git ls-files --others --exclude-standard)"
+          test -z "$checkout_untracked"
+      - name: Build unchanged baseline runtime
+        if: ${{ matrix.suite == 'runtime' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "${DENO_TEST_UTIL_DENO_EXE+x}"
+          test -z "${CARGO_TARGET_DIR+x}"
+          test -z "${CARGO_BUILD_TARGET+x}"
+          test -z "${CI_SHARD_INDEX+x}"
+          test -z "${CI_SHARD_TOTAL+x}"
+          test -z "${UPDATE+x}"
+          test ! -L target
+          cargo build --locked -p deno -p test_server --bin deno --bin test_server
+          actual_tree="$(git write-tree)"
+          test "$actual_tree" = "$EXPECTED_RED_TREE"
+          git diff --exit-code
+          test -f target/debug/deno && test ! -L target/debug/deno
+          sha256sum target/debug/deno | cut -d' ' -f1 > "$RUNNER_TEMP/red-deno.sha256"
+          grep -Ex '[0-9a-f]{64}' "$RUNNER_TEMP/red-deno.sha256"
+      - name: Verify baseline harness selection and failure evidence
+        if: ${{ matrix.suite == 'runtime' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          require_child_case() {
+            local file="$1" category="$2" name="$3" outcome="$4" count total pattern all_pattern code
+            printf '%s\n' "$name" | grep -Eq '^[[:alnum:]_ ]+$'
+            pattern="^\[unit::${category} [0-9]+[.][0-9]{2}\] ${name} \.\.\. ${outcome} \([^)]*\)$"
+            all_pattern="^\[unit::${category} [0-9]+[.][0-9]{2}\] ${name} \.\.\. (ok|FAILED|ignored|skipped)( \([^)]*\))?$"
+            count="$(grep -Ec -- "$pattern" "$file")" || { code=$?; test "$code" -eq 1 || return "$code"; }
+            total="$(grep -Ec -- "$all_pattern" "$file")" || { code=$?; test "$code" -eq 1 || return "$code"; }
+            test "$count" = 1
+            test "$total" = 1
+          }
+          require_child_summary() {
+            local file="$1" category="$2" outcome="$3" passed="$4" failed="$5" count total pattern all_pattern code
+            pattern="^\[unit::${category} [0-9]+[.][0-9]{2}\] ${outcome} \| ${passed} passed \| ${failed} failed( \| 0 (ignored|filtered out))* \([^)]*\)$"
+            all_pattern="^\[unit::${category} [0-9]+[.][0-9]{2}\] (ok|FAILED) \| [0-9]+ passed \| [0-9]+ failed( \|| \()"
+            count="$(grep -Ec -- "$pattern" "$file")" || { code=$?; test "$code" -eq 1 || return "$code"; }
+            total="$(grep -Ec -- "$all_pattern" "$file")" || { code=$?; test "$code" -eq 1 || return "$code"; }
+            test "$count" = 1
+            test "$total" = 1
+          }
+          require_cargo_harness_invocation() {
+            local file="$1" harness workspace relative base expected
+            harness="$(cat "$RUNNER_TEMP/harness.path")"
+            workspace="$(pwd -P)"
+            case "$harness" in "$workspace"/target/debug/deps/unit-*) ;; *) return 1;; esac
+            relative="${harness#"$workspace"/}"
+            base="${relative##*/}"
+            [[ "$base" =~ ^unit-[0-9a-f]+$ ]]
+            expected="Running mod.rs ($relative)"
+            grep -E '^[[:space:]]*Running (mod[.]rs|tests/unit/mod[.]rs) [(]' "$file" | sed 's/^[[:space:]]*//' > "$RUNNER_TEMP/cargo-running-lines.txt"
+            printf '%s\n' "$expected" | cmp - "$RUNNER_TEMP/cargo-running-lines.txt"
+          }
+          test -z "${DENO_TEST_UTIL_DENO_EXE+x}"
+          test -z "${CARGO_TARGET_DIR+x}"
+          test -z "${CARGO_BUILD_TARGET+x}"
+          test -z "${CI_SHARD_INDEX+x}"
+          test -z "${CI_SHARD_TOTAL+x}"
+          test -z "${UPDATE+x}"
+          test -f target/debug/deno && test ! -L target/debug/deno && test -x target/debug/deno
+          test -f target/debug/test_server && test ! -L target/debug/test_server && test -x target/debug/test_server
+          test ! -L target/debug && test ! -L target/debug/deps
+          env -u CI cargo test --locked -p unit_tests --test unit --no-run --message-format=json \
+            > "$RUNNER_TEMP/harness-artifacts.jsonl" 2> "$RUNNER_TEMP/harness-build.stderr"
+          cat "$RUNNER_TEMP/harness-build.stderr"
+          python3 - "$RUNNER_TEMP/harness-artifacts.jsonl" > "$RUNNER_TEMP/harness.path" <<'PYCODE'
+          import json, os, pathlib, sys
+          workspace = pathlib.Path.cwd().resolve(strict=True)
+          debug = (workspace / 'target' / 'debug').resolve(strict=True)
+          if debug != workspace / 'target' / 'debug':
+              raise SystemExit('target/debug resolves outside the checkout')
+          target_manifest = workspace / 'tests' / 'unit' / 'Cargo.toml'
+          candidates = []
+          with open(sys.argv[1], encoding='utf-8') as source:
+              for line in source:
+                  msg = json.loads(line)
+                  target = msg.get('target', {})
+                  if (msg.get('reason') == 'compiler-artifact'
+                          and pathlib.Path(msg.get('manifest_path', '/')).resolve() == target_manifest
+                          and target.get('name') == 'unit'
+                          and 'test' in target.get('kind', [])
+                          and msg.get('executable')):
+                      candidates.append(pathlib.Path(msg['executable']))
+          if len(candidates) != 1:
+              raise SystemExit(f'expected one unit harness executable, got {len(candidates)}')
+          exe = candidates[0]
+          if (not exe.is_absolute() or exe.is_symlink() or not exe.is_file()
+                  or not os.access(exe, os.X_OK) or exe.resolve(strict=True).parent != debug / 'deps'):
+              raise SystemExit('unit harness path is not the expected regular executable')
+          for binary in ('deno', 'test_server'):
+              path = debug / binary
+              if path.is_symlink() or not path.is_file() or not os.access(path, os.X_OK):
+                  raise SystemExit(f'{binary} is not a regular executable in expected target dir')
+          print(exe.resolve(strict=True))
+          PYCODE
+          harness_path="$(cat "$RUNNER_TEMP/harness.path")"
+          test -n "$harness_path"
+          sha256sum "$harness_path" | cut -d' ' -f1 > "$RUNNER_TEMP/harness.sha256"
+          sha256sum target/debug/test_server | cut -d' ' -f1 > "$RUNNER_TEMP/test-server.sha256"
+          grep -Ex '[0-9a-f]{64}' "$RUNNER_TEMP/harness.sha256"
+          grep -Ex '[0-9a-f]{64}' "$RUNNER_TEMP/test-server.sha256"
+          printf 'Harness %s\n' "$harness_path"
+          sha256sum "$harness_path" target/debug/deno target/debug/test_server
+          actual_tree="$(git write-tree)"
+          test "$actual_tree" = "$EXPECTED_RED_TREE"
+          git diff --exit-code
+          env -u CI cargo test --locked -p unit_tests --test unit -- unit::body_test --list \
+            > "$RUNNER_TEMP/red-list.stdout" 2> "$RUNNER_TEMP/red-list.stderr"
+          printf '%s\n' "$EXPECTED_BODY_LIST_MARKER" | cmp - "$RUNNER_TEMP/red-list.stdout"
+          cat "$RUNNER_TEMP/red-list.stdout"
+          cat "$RUNNER_TEMP/red-list.stderr"
+          require_cargo_harness_invocation "$RUNNER_TEMP/red-list.stderr"
+          set +e
+          env -u CI cargo test --locked -p unit_tests --test unit -- unit::body_test --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/red.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          test "${statuses[0]}" -eq 101
+          test "${statuses[1]}" -eq 0
+          require_cargo_harness_invocation "$RUNNER_TEMP/red.log"
+          for name in \
+            'URLSearchParams body ignores own toString' \
+            'URLSearchParams body ignores subclass toString' \
+            'URLSearchParams body ignores prototype toString' \
+            'FormData body ignores own iterator' \
+            'FormData body ignores subclass iterator' \
+            'FormData body ignores prototype iterator'; do
+            require_child_case "$RUNNER_TEMP/red.log" body_test "$name" FAILED
+          done
+          require_child_case "$RUNNER_TEMP/red.log" body_test emptyFormAndSearchParamsBodies ok
+          require_child_case "$RUNNER_TEMP/red.log" body_test formAndSearchParamsBodySnapshotsPreserveContentType ok
+          require_child_summary "$RUNNER_TEMP/red.log" body_test FAILED 27 6
+          grep -Fx -- 'failed tests:' "$RUNNER_TEMP/red.log"
+          result_count="$(grep -Fxc -- '    unit::body_test' "$RUNNER_TEMP/red.log")" || { code=$?; test "$code" -eq 1 || exit "$code"; }
+          test "$result_count" = 1
+          grep -Fx -- '1 failed of 1' "$RUNNER_TEMP/red.log"
+          actual_tree="$(git write-tree)"
+          test "$actual_tree" = "$EXPECTED_RED_TREE"
+          git diff --exit-code
+          actual_digest="$(sha256sum target/debug/deno | cut -d' ' -f1)"
+          expected_digest="$(cat "$RUNNER_TEMP/red-deno.sha256")"
+          [[ "$actual_digest" =~ ^[0-9a-f]{64}$ && "$expected_digest" =~ ^[0-9a-f]{64}$ ]]
+          test "$actual_digest" = "$expected_digest"
+          harness_path="$(cat "$RUNNER_TEMP/harness.path")"
+          actual_digest="$(sha256sum "$harness_path" | cut -d' ' -f1)"
+          expected_digest="$(cat "$RUNNER_TEMP/harness.sha256")"
+          [[ "$actual_digest" =~ ^[0-9a-f]{64}$ && "$expected_digest" =~ ^[0-9a-f]{64}$ ]]
+          test "$actual_digest" = "$expected_digest"
+          actual_digest="$(sha256sum target/debug/test_server | cut -d' ' -f1)"
+          expected_digest="$(cat "$RUNNER_TEMP/test-server.sha256")"
+          [[ "$actual_digest" =~ ^[0-9a-f]{64}$ && "$expected_digest" =~ ^[0-9a-f]{64}$ ]]
+          test "$actual_digest" = "$expected_digest"
+          std_head="$(git -C tests/util/std rev-parse HEAD)"
+          test "$std_head" = "$EXPECTED_STD_SHA"
+          std_status="$(git -C tests/util/std status --porcelain --untracked-files=all --ignored=matching)"
+          test -z "$std_status"
+          git -C tests/util/std submodule status --recursive > "$RUNNER_TEMP/std-submodules-after.txt"
+          test ! -s "$RUNNER_TEMP/std-submodules-after.txt"
+          checkout_untracked="$(git ls-files --others --exclude-standard)"
+          test -z "$checkout_untracked"
+      - name: Select complete reviewed candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git reset --hard "$EXPECTED_BASE"
+          git apply --check "$RUNNER_TEMP/candidate.patch"
+          git apply "$RUNNER_TEMP/candidate.patch"
+          git --literal-pathspecs add --pathspec-from-file="$RUNNER_TEMP/candidate-paths.txt"
+          actual_tree="$(git write-tree)"
+          test "$actual_tree" = "$EXPECTED_CANDIDATE_TREE"
+          git diff --cached --name-only > "$RUNNER_TEMP/actual-candidate-paths.txt"
+          cmp "$RUNNER_TEMP/candidate-paths.txt" "$RUNNER_TEMP/actual-candidate-paths.txt"
+          git diff --exit-code
+          checkout_untracked="$(git ls-files --others --exclude-standard)"
+          test -z "$checkout_untracked"
+      - name: Run project formatting and lint
+        if: ${{ matrix.suite == 'style' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./x fmt
+          std_head="$(git -C tests/util/std rev-parse HEAD)"
+          test "$std_head" = "$EXPECTED_STD_SHA"
+          std_status="$(git -C tests/util/std status --porcelain --untracked-files=all --ignored=matching)"
+          test -z "$std_status"
+          actual_tree="$(git write-tree)"
+          test "$actual_tree" = "$EXPECTED_CANDIDATE_TREE"
+          git diff --exit-code
+          checkout_untracked="$(git ls-files --others --exclude-standard)"
+          test -z "$checkout_untracked"
+          ./x lint
+          std_head="$(git -C tests/util/std rev-parse HEAD)"
+          test "$std_head" = "$EXPECTED_STD_SHA"
+          std_status="$(git -C tests/util/std status --porcelain --untracked-files=all --ignored=matching)"
+          test -z "$std_status"
+          actual_tree="$(git write-tree)"
+          test "$actual_tree" = "$EXPECTED_CANDIDATE_TREE"
+          git diff --exit-code
+          checkout_untracked="$(git ls-files --others --exclude-standard)"
+          test -z "$checkout_untracked"
+      - name: Build exact candidate runtime
+        if: ${{ matrix.suite == 'runtime' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "${DENO_TEST_UTIL_DENO_EXE+x}"
+          test -z "${CARGO_TARGET_DIR+x}"
+          test -z "${CARGO_BUILD_TARGET+x}"
+          test -z "${CI_SHARD_INDEX+x}"
+          test -z "${CI_SHARD_TOTAL+x}"
+          test -z "${UPDATE+x}"
+          test ! -L target
+          cargo build --locked -p deno -p test_server --bin deno --bin test_server
+          actual_tree="$(git write-tree)"
+          test "$actual_tree" = "$EXPECTED_CANDIDATE_TREE"
+          git diff --exit-code
+          test -f target/debug/deno && test ! -L target/debug/deno
+          sha256sum target/debug/deno | cut -d' ' -f1 > "$RUNNER_TEMP/green-deno.sha256"
+          grep -Ex '[0-9a-f]{64}' "$RUNNER_TEMP/green-deno.sha256"
+          red_digest="$(cat "$RUNNER_TEMP/red-deno.sha256")"
+          green_digest="$(cat "$RUNNER_TEMP/green-deno.sha256")"
+          [[ "$red_digest" =~ ^[0-9a-f]{64}$ && "$green_digest" =~ ^[0-9a-f]{64}$ ]]
+          test "$red_digest" != "$green_digest"
+          printf 'Baseline Deno SHA256: %s\nCandidate Deno SHA256: %s\n' "$red_digest" "$green_digest"
+      - name: Run full selected body and response files through project harness
+        if: ${{ matrix.suite == 'runtime' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          require_child_case() {
+            local file="$1" category="$2" name="$3" outcome="$4" count total pattern all_pattern code
+            printf '%s\n' "$name" | grep -Eq '^[[:alnum:]_ ]+$'
+            pattern="^\[unit::${category} [0-9]+[.][0-9]{2}\] ${name} \.\.\. ${outcome} \([^)]*\)$"
+            all_pattern="^\[unit::${category} [0-9]+[.][0-9]{2}\] ${name} \.\.\. (ok|FAILED|ignored|skipped)( \([^)]*\))?$"
+            count="$(grep -Ec -- "$pattern" "$file")" || { code=$?; test "$code" -eq 1 || return "$code"; }
+            total="$(grep -Ec -- "$all_pattern" "$file")" || { code=$?; test "$code" -eq 1 || return "$code"; }
+            test "$count" = 1
+            test "$total" = 1
+          }
+          require_child_summary() {
+            local file="$1" category="$2" outcome="$3" passed="$4" failed="$5" count total pattern all_pattern code
+            pattern="^\[unit::${category} [0-9]+[.][0-9]{2}\] ${outcome} \| ${passed} passed \| ${failed} failed( \| 0 (ignored|filtered out))* \([^)]*\)$"
+            all_pattern="^\[unit::${category} [0-9]+[.][0-9]{2}\] (ok|FAILED) \| [0-9]+ passed \| [0-9]+ failed( \|| \()"
+            count="$(grep -Ec -- "$pattern" "$file")" || { code=$?; test "$code" -eq 1 || return "$code"; }
+            total="$(grep -Ec -- "$all_pattern" "$file")" || { code=$?; test "$code" -eq 1 || return "$code"; }
+            test "$count" = 1
+            test "$total" = 1
+          }
+          require_cargo_harness_invocation() {
+            local file="$1" harness workspace relative base expected
+            harness="$(cat "$RUNNER_TEMP/harness.path")"
+            workspace="$(pwd -P)"
+            case "$harness" in "$workspace"/target/debug/deps/unit-*) ;; *) return 1;; esac
+            relative="${harness#"$workspace"/}"
+            base="${relative##*/}"
+            [[ "$base" =~ ^unit-[0-9a-f]+$ ]]
+            expected="Running mod.rs ($relative)"
+            grep -E '^[[:space:]]*Running (mod[.]rs|tests/unit/mod[.]rs) [(]' "$file" | sed 's/^[[:space:]]*//' > "$RUNNER_TEMP/cargo-running-lines.txt"
+            printf '%s\n' "$expected" | cmp - "$RUNNER_TEMP/cargo-running-lines.txt"
+          }
+          test -z "${DENO_TEST_UTIL_DENO_EXE+x}"
+          test -z "${CARGO_TARGET_DIR+x}"
+          test -z "${CARGO_BUILD_TARGET+x}"
+          test -z "${CI_SHARD_INDEX+x}"
+          test -z "${CI_SHARD_TOTAL+x}"
+          test -z "${UPDATE+x}"
+          test -f target/debug/deno && test ! -L target/debug/deno && test -x target/debug/deno
+          test -f target/debug/test_server && test ! -L target/debug/test_server && test -x target/debug/test_server
+          test ! -L target/debug && test ! -L target/debug/deps
+          env -u CI cargo test --locked -p unit_tests --test unit --no-run --message-format=json \
+            > "$RUNNER_TEMP/harness-artifacts.jsonl" 2> "$RUNNER_TEMP/harness-build.stderr"
+          cat "$RUNNER_TEMP/harness-build.stderr"
+          python3 - "$RUNNER_TEMP/harness-artifacts.jsonl" > "$RUNNER_TEMP/harness.path" <<'PYCODE'
+          import json, os, pathlib, sys
+          workspace = pathlib.Path.cwd().resolve(strict=True)
+          debug = (workspace / 'target' / 'debug').resolve(strict=True)
+          if debug != workspace / 'target' / 'debug':
+              raise SystemExit('target/debug resolves outside the checkout')
+          target_manifest = workspace / 'tests' / 'unit' / 'Cargo.toml'
+          candidates = []
+          with open(sys.argv[1], encoding='utf-8') as source:
+              for line in source:
+                  msg = json.loads(line)
+                  target = msg.get('target', {})
+                  if (msg.get('reason') == 'compiler-artifact'
+                          and pathlib.Path(msg.get('manifest_path', '/')).resolve() == target_manifest
+                          and target.get('name') == 'unit'
+                          and 'test' in target.get('kind', [])
+                          and msg.get('executable')):
+                      candidates.append(pathlib.Path(msg['executable']))
+          if len(candidates) != 1:
+              raise SystemExit(f'expected one unit harness executable, got {len(candidates)}')
+          exe = candidates[0]
+          if (not exe.is_absolute() or exe.is_symlink() or not exe.is_file()
+                  or not os.access(exe, os.X_OK) or exe.resolve(strict=True).parent != debug / 'deps'):
+              raise SystemExit('unit harness path is not the expected regular executable')
+          for binary in ('deno', 'test_server'):
+              path = debug / binary
+              if path.is_symlink() or not path.is_file() or not os.access(path, os.X_OK):
+                  raise SystemExit(f'{binary} is not a regular executable in expected target dir')
+          print(exe.resolve(strict=True))
+          PYCODE
+          harness_path="$(cat "$RUNNER_TEMP/harness.path")"
+          test -n "$harness_path"
+          sha256sum "$harness_path" | cut -d' ' -f1 > "$RUNNER_TEMP/harness.sha256"
+          sha256sum target/debug/test_server | cut -d' ' -f1 > "$RUNNER_TEMP/test-server.sha256"
+          grep -Ex '[0-9a-f]{64}' "$RUNNER_TEMP/harness.sha256"
+          grep -Ex '[0-9a-f]{64}' "$RUNNER_TEMP/test-server.sha256"
+          printf 'Harness %s\n' "$harness_path"
+          sha256sum "$harness_path" target/debug/deno target/debug/test_server
+          actual_tree="$(git write-tree)"
+          test "$actual_tree" = "$EXPECTED_CANDIDATE_TREE"
+          git diff --exit-code
+          env -u CI cargo test --locked -p unit_tests --test unit -- unit::body_test --list \
+            > "$RUNNER_TEMP/green-body-list.stdout" 2> "$RUNNER_TEMP/green-body-list.stderr"
+          printf '%s\n' "$EXPECTED_BODY_LIST_MARKER" | cmp - "$RUNNER_TEMP/green-body-list.stdout"
+          cat "$RUNNER_TEMP/green-body-list.stdout"
+          cat "$RUNNER_TEMP/green-body-list.stderr"
+          require_cargo_harness_invocation "$RUNNER_TEMP/green-body-list.stderr"
+          env -u CI cargo test --locked -p unit_tests --test unit -- unit::body_test --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/green-body.log"
+          require_cargo_harness_invocation "$RUNNER_TEMP/green-body.log"
+          for name in \
+            'URLSearchParams body ignores own toString' \
+            'URLSearchParams body ignores subclass toString' \
+            'URLSearchParams body ignores prototype toString' \
+            'FormData body ignores own iterator' \
+            'FormData body ignores subclass iterator' \
+            'FormData body ignores prototype iterator' \
+            'emptyFormAndSearchParamsBodies' \
+            'formAndSearchParamsBodySnapshotsPreserveContentType' \
+            'bodyURLSearchParams' \
+            'bodyMultipartFormDataNonAsciiRoundtrip' \
+            'bodyMultipartFormData' \
+            'bodyURLEncodedFormData'; do
+            require_child_case "$RUNNER_TEMP/green-body.log" body_test "$name" ok
+          done
+          require_child_summary "$RUNNER_TEMP/green-body.log" body_test ok "$EXPECTED_BODY_GREEN_COUNT" 0
+          result_count="$(grep -Fxc -- '1 tests passed' "$RUNNER_TEMP/green-body.log")" || { code=$?; test "$code" -eq 1 || exit "$code"; }
+          test "$result_count" = 1
+          actual_tree="$(git write-tree)"
+          test "$actual_tree" = "$EXPECTED_CANDIDATE_TREE"
+          git diff --exit-code
+          env -u CI cargo test --locked -p unit_tests --test unit -- unit::response_test --list \
+            > "$RUNNER_TEMP/response-list.stdout" 2> "$RUNNER_TEMP/response-list.stderr"
+          printf '%s\n' "$EXPECTED_RESPONSE_LIST_MARKER" | cmp - "$RUNNER_TEMP/response-list.stdout"
+          cat "$RUNNER_TEMP/response-list.stdout"
+          cat "$RUNNER_TEMP/response-list.stderr"
+          require_cargo_harness_invocation "$RUNNER_TEMP/response-list.stderr"
+          env -u CI cargo test --locked -p unit_tests --test unit -- unit::response_test --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/response.log"
+          require_cargo_harness_invocation "$RUNNER_TEMP/response.log"
+          require_child_case "$RUNNER_TEMP/response.log" response_test responseFormData ok
+          require_child_summary "$RUNNER_TEMP/response.log" response_test ok "$EXPECTED_RESPONSE_GREEN_COUNT" 0
+          result_count="$(grep -Fxc -- '1 tests passed' "$RUNNER_TEMP/response.log")" || { code=$?; test "$code" -eq 1 || exit "$code"; }
+          test "$result_count" = 1
+          actual_tree="$(git write-tree)"
+          test "$actual_tree" = "$EXPECTED_CANDIDATE_TREE"
+          git diff --exit-code
+          actual_digest="$(sha256sum target/debug/deno | cut -d' ' -f1)"
+          expected_digest="$(cat "$RUNNER_TEMP/green-deno.sha256")"
+          [[ "$actual_digest" =~ ^[0-9a-f]{64}$ && "$expected_digest" =~ ^[0-9a-f]{64}$ ]]
+          test "$actual_digest" = "$expected_digest"
+          harness_path="$(cat "$RUNNER_TEMP/harness.path")"
+          actual_digest="$(sha256sum "$harness_path" | cut -d' ' -f1)"
+          expected_digest="$(cat "$RUNNER_TEMP/harness.sha256")"
+          [[ "$actual_digest" =~ ^[0-9a-f]{64}$ && "$expected_digest" =~ ^[0-9a-f]{64}$ ]]
+          test "$actual_digest" = "$expected_digest"
+          actual_digest="$(sha256sum target/debug/test_server | cut -d' ' -f1)"
+          expected_digest="$(cat "$RUNNER_TEMP/test-server.sha256")"
+          [[ "$actual_digest" =~ ^[0-9a-f]{64}$ && "$expected_digest" =~ ^[0-9a-f]{64}$ ]]
+          test "$actual_digest" = "$expected_digest"
+          std_head="$(git -C tests/util/std rev-parse HEAD)"
+          test "$std_head" = "$EXPECTED_STD_SHA"
+          std_status="$(git -C tests/util/std status --porcelain --untracked-files=all --ignored=matching)"
+          test -z "$std_status"
+          git -C tests/util/std submodule status --recursive > "$RUNNER_TEMP/std-submodules-after.txt"
+          test ! -s "$RUNNER_TEMP/std-submodules-after.txt"
+          checkout_untracked="$(git ls-files --others --exclude-standard)"
+          test -z "$checkout_untracked"
